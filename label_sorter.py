@@ -132,18 +132,29 @@ def sort_labels(input_pdf: str, output_dir: str = None, filter_duplicates: bool 
     print(f"📄 Reading: {input_path.name}")
     reader = PdfReader(str(input_path))
     total_pages = len(reader.pages)
-    print(f"   Found {total_pages} labels")
+    print(f"   Found {total_pages} pages")
     
-    # Phase 1: Extract info from all pages
+    # Phase 1: Extract info from all pages (skip blank pages)
     all_labels = []
+    blank_pages = 0
     for i, page in enumerate(reader.pages):
         text = page.extract_text() or ''
+        
+        # Skip blank/empty pages (common in merged PDFs)
+        if len(text.strip()) < 20:
+            blank_pages += 1
+            continue
+        
         info = extract_label_info(text)
         info['page_index'] = i
         all_labels.append(info)
         
         if (i + 1) % 50 == 0:
-            print(f"   Processed {i + 1}/{total_pages} labels...")
+            print(f"   Processed {i + 1}/{total_pages} pages...")
+    
+    if blank_pages > 0:
+        print(f"   ⚪ Skipped {blank_pages} blank page(s)")
+    print(f"   Found {len(all_labels)} valid labels")
     
     # Phase 2: Detect duplicates by phone number
     phone_order_map = defaultdict(list)
