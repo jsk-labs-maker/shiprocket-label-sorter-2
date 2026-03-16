@@ -369,16 +369,26 @@ def sort_labels(pdf_file, filter_duplicates: bool = True) -> tuple:
     total_pages = len(reader.pages)
     
     all_labels = []
+    blank_pages = []
     progress_bar = st.progress(0, text="Scanning labels...")
     
     for i, page in enumerate(reader.pages):
         text = page.extract_text() or ''
+        
+        # Skip blank/empty pages (common in merged PDFs)
+        if len(text.strip()) < 20:
+            blank_pages.append(i)
+            progress_bar.progress((i + 1) / total_pages, text=f"Scanning label {i+1} of {total_pages}")
+            continue
+        
         info = extract_label_info(text)
         info['page_index'] = i
         all_labels.append(info)
         progress_bar.progress((i + 1) / total_pages, text=f"Scanning label {i+1} of {total_pages}")
     
     progress_bar.progress(1.0, text="Detecting duplicate contacts...")
+    
+    actual_labels = len(all_labels)
     
     # Detect duplicates by phone
     phone_order_map = defaultdict(list)
@@ -395,7 +405,7 @@ def sort_labels(pdf_file, filter_duplicates: bool = True) -> tuple:
             for dup_idx in indices[1:]:
                 duplicate_page_indices.add(all_labels[dup_idx]['page_index'])
     
-    # Group pages
+    # Group pages (skip blank + skip duplicates)
     groups = defaultdict(list)
     for label in all_labels:
         if label['page_index'] not in duplicate_page_indices:
@@ -454,6 +464,8 @@ def sort_labels(pdf_file, filter_duplicates: bool = True) -> tuple:
         'duplicate_labels_removed': len(duplicate_page_indices),
         'duplicate_phones': duplicate_phones,
         'all_labels': all_labels,
+        'blank_pages': len(blank_pages),
+        'actual_labels': actual_labels,
     }
 
 
@@ -513,20 +525,23 @@ if uploaded_file:
             try:
                 zip_buffer, results, total_pages, dup_info = sort_labels(uploaded_file, filter_duplicates=filter_dupes)
                 all_labels = dup_info['all_labels']
+                actual_labels = dup_info['actual_labels']
+                blank_pages = dup_info['blank_pages']
                 
                 # --- Metrics Row ---
                 st.markdown("")
                 m1, m2, m3, m4 = st.columns(4)
                 
-                total_after = total_pages - dup_info['duplicate_labels_removed']
                 courier_count = len(set(r['courier'] for r in results))
                 sku_count = len(set(r['sku'] for r in results))
                 
                 with m1:
+                    blank_note = f'<div style="font-size:0.65rem;color:#94a3b8;margin-top:2px;">{blank_pages} blank skipped</div>' if blank_pages > 0 else ''
                     st.markdown(f"""
                     <div class="metric-card">
-                        <div class="metric-value text-indigo">{total_pages}</div>
+                        <div class="metric-value text-indigo">{actual_labels}</div>
                         <div class="metric-label">Total Labels</div>
+                        {blank_note}
                     </div>""", unsafe_allow_html=True)
                 with m2:
                     st.markdown(f"""
