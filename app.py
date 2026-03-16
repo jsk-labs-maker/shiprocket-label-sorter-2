@@ -2,7 +2,7 @@
 Shiprocket Label Sorter 2.0 - Web Interface
 =============================================
 Upload bulk labels → Get sorted PDFs by Courier + SKU
-Now with Duplicate Order Filter & Duplicate Contact Detection
+Duplicate order detection by Customer Contact Number
 
 Built by Kluzo 😎 for JSK Labs
 """
@@ -24,35 +24,22 @@ st.set_page_config(
 
 # --- Helper Functions ---
 
-def normalize_courier(courier_raw: str) -> str:
-    """Normalize courier names for consistent file naming."""
-    courier_lower = courier_raw.lower()
-    
-    if 'ekart' in courier_lower:
-        return 'Ekart'
-    elif 'delhivery' in courier_lower:
-        return 'Delhivery'
-    elif 'xpressbees' in courier_lower:
-        return 'Xpressbees'
-    elif 'bluedart' in courier_lower:
-        return 'BlueDart'
-    elif 'dtdc' in courier_lower:
-        return 'DTDC'
-    elif 'shadowfax' in courier_lower:
-        return 'Shadowfax'
-    elif 'ecom' in courier_lower:
-        return 'EcomExpress'
-    else:
-        return re.sub(r'[^\w\-]', '', courier_raw.replace(' ', '-'))[:30]
-
-
 def normalize_sku(sku_raw: str) -> str:
     """Normalize SKU for filename safety."""
     return re.sub(r'[^\w\-]', '', sku_raw.replace(' ', '-'))[:50]
 
 
 def extract_label_info(page_text: str) -> dict:
-    """Extract courier, SKU, date, order ID, and phone from label text."""
+    """
+    Extract courier, SKU, date, order ID, and phone from Shiprocket label text.
+    
+    Tested against actual Shiprocket label PDF text format:
+      - Courier line: "Ekart Special Surface 500gm" / "Delhivery DS 500gm" / "Shadowfax Surface"
+      - SKU in table: between header "Item\\nSKU\\nQty\\nPrice\\nTotal\\n" and "\\n<digit>\\n₹"
+      - Date: "Invoice Date: DD/MM/YYYY"
+      - Order: "Order#: <number>"
+      - Phone: 10-digit number in Ship To block (before "Dimensions:")
+    """
     info = {
         'courier': 'Unknown',
         'sku': 'Unknown',
@@ -62,71 +49,78 @@ def extract_label_info(page_text: str) -> dict:
         'customer_name': None,
     }
     
+    # --- COURIER ---
     courier_patterns = [
-        (r'Ekart[^\n]*', 'Ekart'),
-        (r'Delhivery[^\n]*', 'Delhivery'),
-        (r'Xpressbees[^\n]*', 'Xpressbees'),
-        (r'BlueDart[^\n]*', 'BlueDart'),
-        (r'DTDC[^\n]*', 'DTDC'),
-        (r'Shadowfax[^\n]*', 'Shadowfax'),
-        (r'Ecom\s*Express[^\n]*', 'EcomExpress'),
+        (r'Ekart', 'Ekart'),
+        (r'Delhivery', 'Delhivery'),
+        (r'Xpressbees', 'Xpressbees'),
+        (r'BlueDart', 'BlueDart'),
+        (r'DTDC', 'DTDC'),
+        (r'Shadowfax', 'Shadowfax'),
+        (r'Ecom\s*Express', 'EcomExpress'),
     ]
-    
     for pattern, name in courier_patterns:
-        match = re.search(pattern, page_text, re.IGNORECASE)
-        if match:
+        if re.search(pattern, page_text, re.IGNORECASE):
             info['courier'] = name
             break
     
-    sku_match = re.search(r'SKU:\s*([^\n]+)', page_text)
-    if sku_match:
-        info['sku'] = normalize_sku(sku_match.group(1).strip())
+    # --- SKU (from table block) ---
+    # Actual format: "Item\nSKU\nQty\nPrice\nTotal\n<item desc lines>\n<SKU lines>\n<qty>\n₹"
+    sku_block = re.search(r'Item\nSKU\nQty\nPrice\nTotal\n(.+?)\n(\d+)\n₹', page_text, re.DOTALL)
+    if sku_block:
+        block_lines = sku_block.group(1).strip().split('\n')
+        # SKU is the last short line(s) before qty
+        # Item description lines are long (>40 chars) or contain "..."
+        sku_lines = []
+        for line in reversed(block_lines):
+            stripped = line.strip()
+            if '...' in stripped or len(stripped) > 40 or '|' in stripped:
+                break
+            sku_lines.insert(0, stripped)
+        
+        if sku_lines:
+            info['sku'] = normalize_sku(' '.join(sku_lines))
     
-    date_match = re.search(r'Invoice Date:\s*(\d{4}-\d{2}-\d{2})', page_text)
+    # --- DATE (DD/MM/YYYY → YYYY-MM-DD) ---
+    date_match = re.search(r'Invoice Date:\s*(\d{2}/\d{2}/\d{4})', page_text)
     if date_match:
-        info['date'] = date_match.group(1)
+        try:
+            parsed = datetime.strptime(date_match.group(1), '%d/%m/%Y')
+            info['date'] = parsed.strftime('%Y-%m-%d')
+        except ValueError:
+            pass
     else:
-        date_match = re.search(r'(\d{4}-\d{2}-\d{2})', page_text)
+        # Fallback: YYYY-MM-DD
+        date_match = re.search(r'Invoice Date:\s*(\d{4}-\d{2}-\d{2})', page_text)
         if date_match:
             info['date'] = date_match.group(1)
     
-    # Order ID extraction (Shiprocket order IDs / Order No)
-    order_patterns = [
-        r'Order\s*(?:No|ID|#)[.:;]?\s*([A-Za-z0-9\-_]+)',
-        r'Order[:\s]+([A-Za-z0-9\-_]+)',
-        r'order_id[:\s]+([A-Za-z0-9\-_]+)',
-    ]
-    for pat in order_patterns:
-        m = re.search(pat, page_text, re.IGNORECASE)
-        if m:
-            info['order_id'] = m.group(1).strip()
-            break
+    # --- ORDER ID (Order#: <number>) ---
+    order_match = re.search(r'Order#:\s*(\d+)', page_text)
+    if order_match:
+        info['order_id'] = order_match.group(1).strip()
     
-    # Phone number extraction (Indian 10-digit numbers)
-    phone_patterns = [
-        r'(?:Phone|Mobile|Contact|Tel|Ph)[.:;]?\s*\+?91?\s*[-.]?\s*(\d{10})',
-        r'(?:Phone|Mobile|Contact|Tel|Ph)[.:;]?\s*(\d{10})',
-        r'\b(\d{10})\b',
-    ]
-    for pat in phone_patterns:
-        m = re.search(pat, page_text, re.IGNORECASE)
-        if m:
-            phone = m.group(1).strip()
-            # Validate it looks like a real phone (starts with 6-9 for Indian numbers)
-            if len(phone) == 10 and phone[0] in '6789':
+    # --- PHONE (10-digit in Ship To block, before "Dimensions:") ---
+    ship_to_block = re.search(r'Ship To\n(.+?)Dimensions:', page_text, re.DOTALL)
+    if ship_to_block:
+        phone_match = re.search(r'\b(\d{10})\b', ship_to_block.group(1))
+        if phone_match:
+            phone = phone_match.group(1)
+            if phone[0] in '6789':
                 info['phone'] = phone
-                break
     
-    # Customer name extraction
-    name_match = re.search(r'(?:Customer|Deliver(?:y)?\s*To|Ship\s*To|Name)[.:;]?\s*([A-Za-z ]+)', page_text, re.IGNORECASE)
+    # --- CUSTOMER NAME (line after "Ship To\n") ---
+    name_match = re.search(r'Ship To\n([^\n]+)', page_text)
     if name_match:
-        info['customer_name'] = name_match.group(1).strip()
+        name = name_match.group(1).strip()
+        if name and not name.isdigit():
+            info['customer_name'] = name
     
     return info
 
 
 def sort_labels(pdf_file, filter_duplicates: bool = True) -> tuple:
-    """Sort labels and return zip buffer with results, duplicate info, and duplicate contacts CSV."""
+    """Sort labels and detect duplicates by phone number."""
     reader = PdfReader(pdf_file)
     total_pages = len(reader.pages)
     
@@ -141,33 +135,24 @@ def sort_labels(pdf_file, filter_duplicates: bool = True) -> tuple:
         all_labels.append(info)
         progress_bar.progress((i + 1) / total_pages, text=f"Analyzing label {i+1}/{total_pages}")
     
-    progress_bar.progress(1.0, text="Detecting duplicates...")
+    progress_bar.progress(1.0, text="Detecting duplicates by contact number...")
     
-    # Phase 2: Detect duplicate orders (same order_id appearing multiple times)
-    order_id_map = defaultdict(list)  # order_id -> list of label indices
+    # Phase 2: Detect duplicate orders by PHONE NUMBER
+    phone_order_map = defaultdict(list)
     for idx, label in enumerate(all_labels):
-        if label['order_id']:
-            order_id_map[label['order_id']].append(idx)
-    
-    duplicate_order_ids = {oid: indices for oid, indices in order_id_map.items() if len(indices) > 1}
-    
-    # Phase 3: Detect duplicate contact numbers (same phone used by different orders)
-    phone_map = defaultdict(list)  # phone -> list of label info dicts
-    for label in all_labels:
         if label['phone']:
-            phone_map[label['phone']].append(label)
+            phone_order_map[label['phone']].append(idx)
     
-    duplicate_phones = {phone: labels for phone, labels in phone_map.items() if len(labels) > 1}
+    duplicate_phones = {phone: indices for phone, indices in phone_order_map.items() if len(indices) > 1}
     
-    # Phase 4: Build filtered label list (remove duplicate orders if enabled)
+    # Phase 3: Build filtered list (remove duplicate phone orders if enabled)
     duplicate_page_indices = set()
-    if filter_duplicates and duplicate_order_ids:
-        for oid, indices in duplicate_order_ids.items():
-            # Keep only the first occurrence, mark rest as duplicates
+    if filter_duplicates and duplicate_phones:
+        for phone, indices in duplicate_phones.items():
             for dup_idx in indices[1:]:
                 duplicate_page_indices.add(all_labels[dup_idx]['page_index'])
     
-    # Phase 5: Group pages by (date, courier, sku) — excluding duplicates
+    # Phase 4: Group pages by (date, courier, sku) — excluding duplicates
     groups = defaultdict(list)
     for label in all_labels:
         if label['page_index'] not in duplicate_page_indices:
@@ -176,7 +161,7 @@ def sort_labels(pdf_file, filter_duplicates: bool = True) -> tuple:
     
     progress_bar.progress(1.0, text="Creating sorted PDFs...")
     
-    # Phase 6: Create zip with sorted PDFs + duplicates PDF + duplicate contacts CSV
+    # Phase 5: Create zip
     zip_buffer = io.BytesIO()
     results = []
     
@@ -192,7 +177,6 @@ def sort_labels(pdf_file, filter_duplicates: bool = True) -> tuple:
             pdf_buffer = io.BytesIO()
             writer.write(pdf_buffer)
             pdf_buffer.seek(0)
-            
             zf.writestr(filename, pdf_buffer.getvalue())
             
             results.append({
@@ -203,7 +187,7 @@ def sort_labels(pdf_file, filter_duplicates: bool = True) -> tuple:
                 'labels': len(page_indices)
             })
         
-        # Duplicate orders PDF (if any duplicates were removed)
+        # Duplicate orders PDF
         if duplicate_page_indices:
             dup_writer = PdfWriter()
             for page_idx in sorted(duplicate_page_indices):
@@ -220,12 +204,13 @@ def sort_labels(pdf_file, filter_duplicates: bool = True) -> tuple:
             writer_csv = csv.writer(csv_buffer)
             writer_csv.writerow(['Phone Number', 'Occurrences', 'Order IDs', 'Customer Names', 'SKUs', 'Couriers'])
             
-            for phone, labels in sorted(duplicate_phones.items(), key=lambda x: len(x[1]), reverse=True):
+            for phone, indices in sorted(duplicate_phones.items(), key=lambda x: len(x[1]), reverse=True):
+                labels = [all_labels[i] for i in indices]
                 order_ids = ', '.join(filter(None, [l.get('order_id', '') for l in labels]))
                 names = ', '.join(filter(None, [l.get('customer_name', '') for l in labels]))
                 skus = ', '.join(set(filter(None, [l.get('sku', '') for l in labels])))
                 couriers = ', '.join(set(filter(None, [l.get('courier', '') for l in labels])))
-                writer_csv.writerow([phone, len(labels), order_ids, names, skus, couriers])
+                writer_csv.writerow([phone, len(indices), order_ids, names, skus, couriers])
             
             zf.writestr("_DUPLICATE_CONTACTS.csv", csv_buffer.getvalue())
     
@@ -233,11 +218,10 @@ def sort_labels(pdf_file, filter_duplicates: bool = True) -> tuple:
     progress_bar.empty()
     
     duplicate_info = {
-        'duplicate_order_count': len(duplicate_order_ids),
-        'duplicate_labels_removed': len(duplicate_page_indices),
         'duplicate_phone_count': len(duplicate_phones),
-        'duplicate_order_ids': duplicate_order_ids,
+        'duplicate_labels_removed': len(duplicate_page_indices),
         'duplicate_phones': duplicate_phones,
+        'all_labels': all_labels,
     }
     
     return zip_buffer, results, total_pages, duplicate_info
@@ -246,7 +230,7 @@ def sort_labels(pdf_file, filter_duplicates: bool = True) -> tuple:
 # --- UI ---
 
 st.title("📦 Shiprocket Label Sorter 2.0")
-st.markdown("**Sort bulk labels by Courier + SKU | Duplicate Order & Contact Detection**")
+st.markdown("**Sort bulk labels by Courier + SKU | Duplicate Detection by Contact No.**")
 
 st.divider()
 
@@ -259,8 +243,8 @@ uploaded_file = st.file_uploader(
 if uploaded_file:
     st.info(f"📄 **{uploaded_file.name}** ({uploaded_file.size / 1024:.1f} KB)")
     
-    filter_dupes = st.checkbox("🔍 Filter out duplicate orders", value=True, 
-                                help="Removes duplicate order labels and keeps only the first occurrence")
+    filter_dupes = st.checkbox("🔍 Filter out duplicate orders (by contact number)", value=True, 
+                                help="If the same phone number appears in multiple orders, keeps only the first and removes the rest")
     
     if st.button("🚀 Sort Labels", type="primary", use_container_width=True):
         with st.spinner("Processing..."):
@@ -269,28 +253,24 @@ if uploaded_file:
                 
                 st.success(f"✅ Sorted **{total_pages} labels** into **{len(results)} files**")
                 
-                # Duplicate Orders Summary
-                if dup_info['duplicate_order_count'] > 0:
-                    st.warning(
-                        f"⚠️ Found **{dup_info['duplicate_order_count']} duplicate order(s)** "
-                        f"({dup_info['duplicate_labels_removed']} extra labels {'removed' if filter_dupes else 'detected'})"
-                    )
-                    with st.expander("🔁 Duplicate Order Details"):
-                        for oid, indices in dup_info['duplicate_order_ids'].items():
-                            st.markdown(f"- **Order {oid}**: appears {len(indices)} times (pages {', '.join(str(i+1) for i in indices)})")
-                        if filter_dupes:
-                            st.caption("Duplicate labels saved in `_DUPLICATE_ORDERS.pdf` inside the ZIP.")
-                
                 # Duplicate Contacts Summary
                 if dup_info['duplicate_phone_count'] > 0:
                     st.warning(
-                        f"📱 Found **{dup_info['duplicate_phone_count']} duplicate contact number(s)**"
+                        f"📱 Found **{dup_info['duplicate_phone_count']} duplicate contact number(s)** "
+                        f"({dup_info['duplicate_labels_removed']} extra labels {'removed' if filter_dupes else 'detected'})"
                     )
                     with st.expander("📱 Duplicate Contact Details"):
-                        for phone, labels in sorted(dup_info['duplicate_phones'].items(), key=lambda x: len(x[1]), reverse=True):
+                        all_labels = dup_info['all_labels']
+                        for phone, indices in sorted(dup_info['duplicate_phones'].items(), key=lambda x: len(x[1]), reverse=True):
+                            labels = [all_labels[i] for i in indices]
                             order_ids = ', '.join(filter(None, [l.get('order_id', 'N/A') for l in labels]))
-                            st.markdown(f"- **{phone}**: {len(labels)} orders ({order_ids})")
+                            names = ', '.join(filter(None, [l.get('customer_name', 'N/A') for l in labels]))
+                            st.markdown(f"- **{phone}** — {len(indices)} orders — Orders: {order_ids} — Names: {names}")
                         st.caption("Full list saved in `_DUPLICATE_CONTACTS.csv` inside the ZIP.")
+                        if filter_dupes:
+                            st.caption("Removed duplicate labels saved in `_DUPLICATE_ORDERS.pdf` inside the ZIP.")
+                else:
+                    st.info("✅ No duplicate contact numbers found")
                 
                 # Results table
                 st.subheader("📊 Summary")
@@ -325,22 +305,22 @@ with st.expander("ℹ️ How it works"):
     st.markdown("""
     1. **Upload** your bulk labels PDF from Shiprocket
     2. The tool scans each label and extracts:
-       - Courier name (Ekart, Delhivery, Xpressbees, etc.)
-       - SKU code
+       - Courier name (Ekart, Delhivery, Xpressbees, Shadowfax, etc.)
+       - SKU code (from label table)
        - Invoice date
        - Order ID & Contact number
-    3. **Duplicate Detection:**
-       - Finds duplicate orders (same Order ID appearing multiple times)
-       - Finds duplicate contact numbers (same phone across different orders)
-       - Optionally removes duplicate order labels from output
+    3. **Duplicate Detection (by Contact Number):**
+       - Finds orders with the **same phone number**
+       - Optionally removes duplicate labels from sorted output
+       - Generates `_DUPLICATE_CONTACTS.csv` with full details
     4. Labels are grouped and saved as separate PDFs
     5. **Download** the ZIP with all sorted files
     
     **Output format:** `YYYY-MM-DD_Courier_SKU.pdf`
     
     **Extra files in ZIP:**
-    - `_DUPLICATE_ORDERS.pdf` — Removed duplicate order labels
-    - `_DUPLICATE_CONTACTS.csv` — List of phone numbers used in multiple orders
+    - `_DUPLICATE_ORDERS.pdf` — Removed duplicate order labels  
+    - `_DUPLICATE_CONTACTS.csv` — Phone numbers appearing in multiple orders
     
     **Supported Couriers:** Ekart, Delhivery, Xpressbees, BlueDart, DTDC, Shadowfax, Ecom Express
     """)
