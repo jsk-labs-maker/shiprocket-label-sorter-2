@@ -10,6 +10,7 @@ Built by Kluzo 😎 for JSK Labs
 import streamlit as st
 import re
 import io
+import os
 import csv
 import zipfile
 from collections import defaultdict, Counter
@@ -363,32 +364,52 @@ def extract_label_info(page_text: str) -> dict:
     return info
 
 
+def merge_pdfs_from_zip(zip_file) -> tuple:
+    """
+    Extract all PDFs from a ZIP file and merge them into a single PDF in memory.
+    
+    Returns:
+        (merged_pdf_bytes: BytesIO, pdf_count: int, pdf_names: list)
+    """
+    merged_writer = PdfWriter()
+    pdf_names = []
+    
+    with zipfile.ZipFile(zip_file, 'r') as zf:
+        # Get all PDF files, sorted by name
+        pdf_entries = sorted([n for n in zf.namelist() 
+                             if n.lower().endswith('.pdf') and not n.startswith('__MACOSX')])
+        
+        for pdf_name in pdf_entries:
+            pdf_data = zf.read(pdf_name)
+            pdf_reader = PdfReader(io.BytesIO(pdf_data))
+            pdf_names.append(os.path.basename(pdf_name))
+            
+            for page in pdf_reader.pages:
+                merged_writer.add_page(page)
+    
+    merged_buffer = io.BytesIO()
+    merged_writer.write(merged_buffer)
+    merged_buffer.seek(0)
+    
+    return merged_buffer, len(pdf_names), pdf_names
+
+
 def sort_labels(pdf_file, filter_duplicates: bool = True) -> tuple:
     """Sort labels and detect duplicates by phone number."""
     reader = PdfReader(pdf_file)
     total_pages = len(reader.pages)
     
     all_labels = []
-    blank_pages = []
     progress_bar = st.progress(0, text="Scanning labels...")
     
     for i, page in enumerate(reader.pages):
         text = page.extract_text() or ''
-        
-        # Skip blank/empty pages (common in merged PDFs)
-        if len(text.strip()) < 20:
-            blank_pages.append(i)
-            progress_bar.progress((i + 1) / total_pages, text=f"Scanning label {i+1} of {total_pages}")
-            continue
-        
         info = extract_label_info(text)
         info['page_index'] = i
         all_labels.append(info)
         progress_bar.progress((i + 1) / total_pages, text=f"Scanning label {i+1} of {total_pages}")
     
     progress_bar.progress(1.0, text="Detecting duplicate contacts...")
-    
-    actual_labels = len(all_labels)
     
     # Detect duplicates by phone
     phone_order_map = defaultdict(list)
@@ -405,7 +426,7 @@ def sort_labels(pdf_file, filter_duplicates: bool = True) -> tuple:
             for dup_idx in indices[1:]:
                 duplicate_page_indices.add(all_labels[dup_idx]['page_index'])
     
-    # Group pages (skip blank + skip duplicates)
+    # Group pages — excluding duplicates
     groups = defaultdict(list)
     for label in all_labels:
         if label['page_index'] not in duplicate_page_indices:
@@ -464,8 +485,6 @@ def sort_labels(pdf_file, filter_duplicates: bool = True) -> tuple:
         'duplicate_labels_removed': len(duplicate_page_indices),
         'duplicate_phones': duplicate_phones,
         'all_labels': all_labels,
-        'blank_pages': len(blank_pages),
-        'actual_labels': actual_labels,
     }
 
 
@@ -487,9 +506,9 @@ col_upload, col_options = st.columns([3, 2])
 
 with col_upload:
     uploaded_file = st.file_uploader(
-        "Drop your Shiprocket bulk labels PDF here",
-        type=['pdf'],
-        help="Download bulk labels from Shiprocket and upload here"
+        "Drop your Shiprocket labels here (PDF or ZIP with multiple PDFs)",
+        type=['pdf', 'zip'],
+        help="Upload a single PDF or a ZIP file containing multiple label PDFs"
     )
 
 with col_options:
@@ -500,10 +519,14 @@ with col_options:
         else:
             size_str = f"{file_size / 1024:.1f} KB"
         
+        is_zip = uploaded_file.name.lower().endswith('.zip')
+        icon = "📦" if is_zip else "📄"
+        file_type = "ZIP archive" if is_zip else "PDF file"
+        
         st.markdown(f"""
         <div class="metric-card" style="margin-top: 0.5rem;">
-            <div class="metric-value text-indigo" style="font-size:1.3rem;">📄 {uploaded_file.name}</div>
-            <div class="metric-label">{size_str}</div>
+            <div class="metric-value text-indigo" style="font-size:1.1rem;">{icon} {uploaded_file.name}</div>
+            <div class="metric-label">{size_str} · {file_type}</div>
         </div>
         """, unsafe_allow_html=True)
         
@@ -513,7 +536,7 @@ with col_options:
         st.markdown("""
         <div class="metric-card" style="margin-top: 0.5rem; opacity: 0.6;">
             <div class="metric-value" style="font-size:1.3rem; color: #94a3b8;">No file selected</div>
-            <div class="metric-label">Upload a PDF to get started</div>
+            <div class="metric-label">Upload a PDF or ZIP to get started</div>
         </div>
         """, unsafe_allow_html=True)
         filter_dupes = True
@@ -523,25 +546,32 @@ if uploaded_file:
     if st.button("🚀  Sort & Analyze Labels", type="primary", use_container_width=True):
         with st.spinner(""):
             try:
-                zip_buffer, results, total_pages, dup_info = sort_labels(uploaded_file, filter_duplicates=filter_dupes)
+                # Handle ZIP or PDF
+                is_zip = uploaded_file.name.lower().endswith('.zip')
+                
+                if is_zip:
+                    st.info("📦 Extracting PDFs from ZIP...")
+                    merged_pdf, pdf_count, pdf_names = merge_pdfs_from_zip(uploaded_file)
+                    st.success(f"📦 Found **{pdf_count} PDFs** in ZIP: {', '.join(pdf_names)}")
+                    process_file = merged_pdf
+                else:
+                    process_file = uploaded_file
+                
+                zip_buffer, results, total_pages, dup_info = sort_labels(process_file, filter_duplicates=filter_dupes)
                 all_labels = dup_info['all_labels']
-                actual_labels = dup_info['actual_labels']
-                blank_pages = dup_info['blank_pages']
                 
                 # --- Metrics Row ---
                 st.markdown("")
                 m1, m2, m3, m4 = st.columns(4)
                 
-                courier_count = len(set(r['courier'] for r in results))
-                sku_count = len(set(r['sku'] for r in results))
+                courier_count = len(set(r['courier'] for r in results if r['courier'] != 'Unknown'))
+                sku_count = len(set(r['sku'] for r in results if r['sku'] != 'Unknown'))
                 
                 with m1:
-                    blank_note = f'<div style="font-size:0.65rem;color:#94a3b8;margin-top:2px;">{blank_pages} blank skipped</div>' if blank_pages > 0 else ''
                     st.markdown(f"""
                     <div class="metric-card">
-                        <div class="metric-value text-indigo">{actual_labels}</div>
+                        <div class="metric-value text-indigo">{total_pages}</div>
                         <div class="metric-label">Total Labels</div>
-                        {blank_note}
                     </div>""", unsafe_allow_html=True)
                 with m2:
                     st.markdown(f"""
@@ -676,7 +706,7 @@ with st.expander("ℹ️  How it works"):
     with c1:
         st.markdown("""
         **1. Upload**  
-        Drop your Shiprocket bulk labels PDF. The tool reads every page and extracts courier, SKU, date, order ID, and phone number.
+        Drop a single PDF or a **ZIP containing multiple PDFs**. The tool merges all PDFs, reads every page, and extracts courier, SKU, date, order ID, and phone number.
         """)
     with c2:
         st.markdown("""
